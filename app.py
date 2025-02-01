@@ -1,210 +1,191 @@
 import numpy as np
 import pandas as pd
-import streamlit as st
 import plotly.express as px
 import plotly.graph_objs as go
-from sklearn.model_selection import train_test_split,cross_val_score
+from flask import Flask, render_template, request, jsonify
+from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.decomposition import PCA
-from sklearn.ensemble import RandomForestClassifier,AdaBoostClassifier
+from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
 from sklearn.svm import SVC
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import f1_score as f1
-from sklearn.metrics import confusion_matrix
 from plotly.subplots import make_subplots
 from imblearn.over_sampling import SMOTE
-# Streamlit Page Config
-st.set_page_config(layout="wide", page_title="Bank Churn Analysis")
+import io
+import json
 
-# Load the dataset
-@st.cache_data
-def load_data():
-    # file_path = r"C:\Users\nadar\Downloads\BankChurners.csv"  # Ensure correct file path
-    data = pd.read_csv("BankChurners.csv")
+app = Flask(__name__)
+
+def process_data(data):
+    # Create a copy to avoid modifying the original dataframe
+    data = data.copy()
+    
+    # Data preprocessing
     data = data[data.columns[:-2]]  # Drop last two columns
+    data.Attrition_Flag = data.Attrition_Flag.replace({'Attrited Customer':1,'Existing Customer':0})
+    data.Gender = data.Gender.replace({'F':1,'M':0})
+    
+    # One-hot encoding with error handling
+    categorical_columns = ['Education_Level', 'Income_Category', 'Marital_Status', 'Card_Category']
+    drop_values = ['Unknown', 'Unknown', 'Unknown', 'Platinum']
+    
+    for col, drop_val in zip(categorical_columns, drop_values):
+        if col in data.columns:
+            dummies = pd.get_dummies(data[col])
+            if drop_val in dummies.columns:
+                dummies = dummies.drop(columns=[drop_val])
+            data = pd.concat([data, dummies], axis=1)
+    
+    # Drop original categorical columns and CLIENTNUM
+    columns_to_drop = categorical_columns + ['CLIENTNUM']
+    data = data.drop(columns=[col for col in columns_to_drop if col in data.columns])
+    
     return data
 
-# Load Data
-c_data = load_data()
+def generate_charts(data):
+    # Age Distribution
+    fig1 = make_subplots(rows=2, cols=1)
+    tr1 = go.Box(x=data['Customer_Age'].tolist(), name='Age Box Plot', boxmean=True)
+    tr2 = go.Histogram(x=data['Customer_Age'].tolist(), name='Age Histogram')
+    fig1.add_trace(tr1, row=1, col=1)
+    fig1.add_trace(tr2, row=2, col=1)
+    fig1.update_layout(height=700, width=1200, title_text="Distribution of Customer Ages")
+    
+    # Card Category Distribution by Gender
+    fig2 = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=['Platinum Card Holders', 'Blue Card Holders'],
+        specs=[[{"type": "domain"}, {"type": "domain"}]]
+    )
+    
+    # Platinum Card Holders by Gender
+    platinum_data = data[data['Card_Category']=="Platinum"]['Gender'].value_counts()
+    fig2.add_trace(
+        go.Pie(
+            labels=['Female Platinum Card Holders', 'Male Platinum Card Holders'],
+            values=platinum_data.values.tolist(),
+            hole=0.3
+        ),
+        row=1, col=1
+    )
+    
+    # Blue Card Holders by Gender
+    blue_data = data[data['Card_Category']=="Blue"]['Gender'].value_counts()
+    fig2.add_trace(
+        go.Pie(
+            labels=['Female Blue Card Holders', 'Male Blue Card Holders'],
+            values=blue_data.values.tolist(),
+            hole=0.3
+        ),
+        row=1, col=2
+    )
+    
+    # Card Category Distribution
+    fig3 = px.pie(data, names="Card_Category", title="Proportion Of Different Card Categories", hole=0.3)
+    
+    # Churn Distribution
+    fig4 = px.pie(data, names='Attrition_Flag', title='Proportion of churn vs not churn customers', hole=0.3)
+    
+    # Convert to JSON-serializable format
+    charts = {
+        'age_dist': json.loads(fig1.to_json()),
+        'gender_dist': json.loads(fig2.to_json()),
+        'card_dist': json.loads(fig3.to_json()),
+        'churn_dist': json.loads(fig4.to_json())
+    }
+    
+    return charts
 
-# Title
-st.title("📊 Bank Customer Churn Analysis")
+def train_models(data):
+    try:
+        oversample = SMOTE()
+        X = data[data.columns[1:]].copy()
+        y = data[data.columns[0]].copy()
+        X, y = oversample.fit_resample(X, y)
+        usampled_df = pd.DataFrame(X, columns=data.columns[1:])
+        usampled_df['Churn'] = y
+        
+        ohe_data = usampled_df[usampled_df.columns[15:-1]].copy()
+        usampled_df = usampled_df.drop(columns=usampled_df.columns[15:-1])
+        
+        # PCA
+        N_COMPONENTS = 4
+        pca_model = PCA(n_components=N_COMPONENTS)
+        pc_matrix = pca_model.fit_transform(ohe_data)
+        pc_cols = [f'PC-{i}' for i in range(N_COMPONENTS)]
+        usampled_df_with_pcs = pd.concat([
+            usampled_df,
+            pd.DataFrame(pc_matrix, columns=pc_cols)
+        ], axis=1)
+        
+        # Model training
+        X_features = ['Total_Trans_Ct','PC-3','PC-1','PC-0','PC-2',
+                     'Total_Ct_Chng_Q4_Q1','Total_Relationship_Count']
+        X = usampled_df_with_pcs[X_features]
+        y = usampled_df_with_pcs['Churn']
+        
+        train_x, test_x, train_y, test_y = train_test_split(X, y, random_state=42)
+        
+        models = {
+            'Random Forest': Pipeline([
+                ('scale', StandardScaler()),
+                ("RF", RandomForestClassifier(random_state=42))
+            ]),
+            'AdaBoost': Pipeline([
+                ('scale', StandardScaler()),
+                ("ADA", AdaBoostClassifier(random_state=42, learning_rate=0.7))
+            ]),
+            'SVM': Pipeline([
+                ('scale', StandardScaler()),
+                ("SVM", SVC(random_state=42, kernel='rbf'))
+            ])
+        }
+        
+        results = {}
+        for name, model in models.items():
+            model.fit(train_x, train_y)
+            predictions = model.predict(test_x)
+            results[name] = float(f1(test_y, predictions))
+        
+        return results
+        
+    except Exception as e:
+        print(f"Error in train_models: {str(e)}")
+        return {'error': str(e)}
 
-# Show dataset preview if checked
-if st.checkbox("Show raw data"):
-    st.write(c_data.head())
+@app.route('/')
+def home():
+    return render_template('index.html')
 
-# --- 📌 CHART 1: Age Distribution ---
-st.header("📈 Distribution of Customer Ages")
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'})
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'})
+    
+    try:
+        # Read CSV file
+        stream = io.StringIO(file.stream.read().decode("UTF8"), newline=None)
+        data = pd.read_csv(stream)
+        
+        # Generate initial charts from raw data
+        charts = generate_charts(data)
+        
+        # Process data and train models
+        processed_data = process_data(data)
+        model_results = train_models(processed_data)
+        
+        return jsonify({
+            'charts': charts,
+            'model_results': model_results
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)})
 
-# Create subplot for age distribution
-fig1 = make_subplots(rows=2, cols=1)
-
-# Box Plot for Age
-tr1 = go.Box(x=c_data['Customer_Age'], name='Age Box Plot', boxmean=True)
-
-# Histogram for Age
-tr2 = go.Histogram(x=c_data['Customer_Age'], name='Age Histogram')
-
-# Add traces to figure
-fig1.add_trace(tr1, row=1, col=1)
-fig1.add_trace(tr2, row=2, col=1)
-
-# Update layout
-fig1.update_layout(height=700, width=1200, title_text="Distribution of Customer Ages")
-
-# Display plot in Streamlit
-st.plotly_chart(fig1)
-
-st.header(" Card Category Distribution")
-
-# Create subplot for gender distribution
-fig2 = make_subplots(
-    rows=1, cols=2,
-    subplot_titles=['Platinum Card Holders', 'Blue Card Holders'],  # Fixed number of titles
-    specs=[
-        [{"type": "domain"}, {"type": "domain"}]  # Corrected layout
-    ]
-)
-
-# Platinum Card Holders by Gender
-fig2.add_trace(
-    go.Pie(
-        labels=['Female Platinum Card Holders', 'Male Platinum Card Holders'],
-        values=c_data.query('Card_Category=="Platinum"').Gender.value_counts().values,
-        pull=[0, 0.05],  # Matching length with labels
-        hole=0.3
-    ),
-    row=1, col=1
-)
-
-# Blue Card Holders by Gender
-fig2.add_trace(
-    go.Pie(
-        labels=['Female Blue Card Holders', 'Male Blue Card Holders'],
-        values=c_data.query('Card_Category=="Blue"').Gender.value_counts().values,
-        pull=[0, 0.05],  # Matching length with labels
-        hole=0.3
-    ),
-    row=1, col=2
-)
-
-# Update layout
-fig2.update_layout(
-    height=800,
-    showlegend=True,
-    title_text="<b>Distribution Of Different Card Statuses<b>",
-)
-
-# Display plot in Streamlit
-st.plotly_chart(fig2)
-
-fig3 = px.pie(
-    c_data,
-    height=800,
-    names="Card_Category",
-    title="Proportion Of Different Card Categories",
-    hole=0.3,
-)
-
-st.plotly_chart(fig3)
-
-fig4 = px.pie(
-    c_data,
-    height=800,
-    names='Attrition_Flag',
-    title='Proportion of churn vs not churn customers',
-    hole=0.3
-)
-
-st.plotly_chart(fig4)
-
-#Data Preprocessing part
-c_data.Attrition_Flag = c_data.Attrition_Flag.replace({'Attrited Customer':1,'Existing Customer':0})
-c_data.Gender = c_data.Gender.replace({'F':1,'M':0})
-c_data = pd.concat([c_data,pd.get_dummies(c_data['Education_Level']).drop(columns=['Unknown'])],axis=1)
-c_data = pd.concat([c_data,pd.get_dummies(c_data['Income_Category']).drop(columns=['Unknown'])],axis=1)
-c_data = pd.concat([c_data,pd.get_dummies(c_data['Marital_Status']).drop(columns=['Unknown'])],axis=1)
-c_data = pd.concat([c_data,pd.get_dummies(c_data['Card_Category']).drop(columns=['Platinum'])],axis=1)
-c_data.drop(columns = ['Education_Level','Income_Category','Marital_Status','Card_Category','CLIENTNUM'],inplace=True)
-
-oversample = SMOTE()
-X, y = oversample.fit_resample(c_data[c_data.columns[1:]], c_data[c_data.columns[0]])
-usampled_df = X.assign(Churn = y)
-
-ohe_data =usampled_df[usampled_df.columns[15:-1]].copy()
-
-usampled_df = usampled_df.drop(columns=usampled_df.columns[15:-1])
-
-N_COMPONENTS = 4
-
-pca_model = PCA(n_components = N_COMPONENTS )
-
-pc_matrix = pca_model.fit_transform(ohe_data)
-
-evr = pca_model.explained_variance_ratio_
-total_var = evr.sum() * 100
-cumsum_evr = np.cumsum(evr)
-
-trace1 = {
-    "name": "individual explained variance", 
-    "type": "bar", 
-    'y':evr}
-trace2 = {
-    "name": "cumulative explained variance", 
-    "type": "scatter", 
-     'y':cumsum_evr}
-data = [trace1, trace2]
-layout = {
-    "xaxis": {"title": "Principal components"}, 
-    "yaxis": {"title": "Explained variance ratio"},
-  }
-
-usampled_df_with_pcs = pd.concat([usampled_df,pd.DataFrame(pc_matrix,columns=['PC-{}'.format(i) for i in range(0,N_COMPONENTS)])],axis=1)
-
-
-# Pearson Correlation and Spearman Correlation
-s_val =usampled_df_with_pcs.corr('pearson')
-s_idx = s_val.index
-s_col = s_val.columns
-s_val = s_val.values
-
-s_val =usampled_df_with_pcs.corr('spearman')
-s_idx = s_val.index
-s_col = s_val.columns
-s_val = s_val.values
-
-
-#Model Selection and evaluation
-X_features = ['Total_Trans_Ct','PC-3','PC-1','PC-0','PC-2','Total_Ct_Chng_Q4_Q1','Total_Relationship_Count']
-
-X = usampled_df_with_pcs[X_features]
-y = usampled_df_with_pcs['Churn']
-
-train_x,test_x,train_y,test_y = train_test_split(X,y,random_state=42)
-
-#Cross Vaidation
-
-rf_pipe = Pipeline(steps =[ ('scale',StandardScaler()), ("RF",RandomForestClassifier(random_state=42)) ])
-ada_pipe = Pipeline(steps =[ ('scale',StandardScaler()), ("RF",AdaBoostClassifier(random_state=42,learning_rate=0.7)) ])
-svm_pipe = Pipeline(steps =[ ('scale',StandardScaler()), ("RF",SVC(random_state=42,kernel='rbf')) ])
-
-
-f1_cross_val_scores = cross_val_score(rf_pipe,train_x,train_y,cv=5,scoring='f1')
-ada_f1_cross_val_scores=cross_val_score(ada_pipe,train_x,train_y,cv=5,scoring='f1')
-svm_f1_cross_val_scores=cross_val_score(svm_pipe,train_x,train_y,cv=5,scoring='f1')
-
-
-#Model Evaluation
-rf_pipe.fit(train_x,train_y)
-rf_prediction = rf_pipe.predict(test_x)
-
-ada_pipe.fit(train_x,train_y)
-ada_prediction = ada_pipe.predict(test_x)
-
-svm_pipe.fit(train_x,train_y)
-svm_prediction = svm_pipe.predict(test_x)
-
-print(f1(rf_prediction,test_y))
-print(f1(ada_prediction,test_y))
-print(f1(svm_prediction,test_y))
+if __name__ == '__main__':
+    app.run(debug=True)
