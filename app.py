@@ -109,6 +109,10 @@ def train_models(data):
         ohe_data = usampled_df[usampled_df.columns[15:-1]].copy()
         usampled_df = usampled_df.drop(columns=usampled_df.columns[15:-1])
         
+        # New Features
+        usampled_df['Credit_Utilization'] = usampled_df['Total_Revolving_Bal'] / usampled_df['Credit_Limit']
+        usampled_df['CLV'] = usampled_df['Total_Trans_Amt'] * usampled_df['Months_on_book']
+        usampled_df['Inactive_Months_Ratio'] = usampled_df['Months_Inactive_12_mon'] / usampled_df['Months_on_book']
         # PCA
         N_COMPONENTS = 4
         pca_model = PCA(n_components=N_COMPONENTS)
@@ -120,8 +124,8 @@ def train_models(data):
         ], axis=1)
         
         # Model training
-        X_features = ['Total_Trans_Ct','PC-3','PC-1','PC-0','PC-2',
-                     'Total_Ct_Chng_Q4_Q1','Total_Relationship_Count']
+        X_features = ['Total_Trans_Ct', 'PC-3', 'PC-1', 'PC-0', 'PC-2', 'Total_Ct_Chng_Q4_Q1', 'Total_Relationship_Count',
+              'Credit_Utilization', 'CLV', 'Inactive_Months_Ratio']
         X = usampled_df_with_pcs[X_features]
         y = usampled_df_with_pcs['Churn']
         
