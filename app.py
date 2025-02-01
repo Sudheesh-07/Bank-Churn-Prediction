@@ -20,7 +20,7 @@ st.set_page_config(layout="wide", page_title="Bank Churn Analysis")
 @st.cache_data
 def load_data():
     # file_path = r"C:\Users\nadar\Downloads\BankChurners.csv"  # Ensure correct file path
-    data = pd.read_csv("G:/sih/Datathon/BankChurners.csv")
+    data = pd.read_csv("BankChurners.csv")
     data = data[data.columns[:-2]]  # Drop last two columns
     return data
 
